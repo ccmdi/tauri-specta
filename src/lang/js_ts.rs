@@ -993,7 +993,8 @@ fn render_reference_dt(dt: &DataType, exporter: &FrameworkExporter) -> Result<St
     } else {
         match &dt {
             DataType::Reference(r) => exporter.reference(r),
-            dt => exporter.inline(dt),
+            // Expand anonymous structure but keep named types as references.
+            dt => exporter.render(dt),
         }
     }
 }
