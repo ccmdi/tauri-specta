@@ -1053,7 +1053,7 @@ const TYPED_ERROR_ASSERTION_TS: &str = "const _assertTypedErrorFollowsContract: 
 
 const MAKE_EVENT_IMPL_TS: &str = r#"type EventEmit<T> = [T] extends [null] ? () => Promise<void> : (payload: T) => Promise<void>;
 
-function makeEvent<T>(name: string, serialize?: (payload: T) => unknown, deserialize?: (payload: any) => T) {
+function makeEvent<T>(name: string, serialize?: (payload: T) => unknown, deserialize?: (payload: T) => T) {
     const mapEvent = (cb: __TAURI_EVENT.EventCallback<T>) => (event: __TAURI_EVENT.Event<any>) => cb({ ...event, payload: deserialize ? deserialize(event.payload) : event.payload });
     const mapPayload = (payload: T) => serialize ? serialize(payload) : payload;
 
