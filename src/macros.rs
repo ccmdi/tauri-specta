@@ -44,8 +44,28 @@ macro_rules! collect_commands {
         // We strip generics (::<...>) from being parsed to Tauri as it doesn't support them.
         $crate::internal::command(
             ::tauri::generate_handler![$($b $($(::$p)? )* ),*],
-            ::specta::function::collect_functions![$($b $($(::$p)? $(::<$($g),*>)? )* ),*],
+            $crate::__command_types![$($b $($(::$p)? $(::<$($g),*>)? )* ),*],
         )
+    };
+}
+
+/// Only `Builder::export` reads the per-command type descriptions, so release builds skip
+/// generating them; LTO cannot strip them because the collector's pointer sits in `Commands`.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+#[macro_export]
+macro_rules! __command_types {
+    ($($t:tt)*) => {
+        ::specta::function::collect_functions![$($t)*]
+    };
+}
+
+#[doc(hidden)]
+#[cfg(not(debug_assertions))]
+#[macro_export]
+macro_rules! __command_types {
+    ($($t:tt)*) => {
+        |_: &mut ::specta::Types| ::std::vec::Vec::new()
     };
 }
 
