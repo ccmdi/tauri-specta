@@ -223,11 +223,13 @@ mod event;
 mod lang;
 mod macros;
 mod name;
+mod reply;
 
 pub use builder::{Builder, BuilderConfiguration, ErrorHandlingMode};
 pub use commands::Commands;
 pub use event::{Event, Events, TypedEvent};
 pub use lang::LanguageExt;
+pub use reply::Reply;
 
 /// Implements the [`Event`](trait@crate::Event) trait for a struct.
 ///

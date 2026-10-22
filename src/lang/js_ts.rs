@@ -19,7 +19,7 @@ impl LanguageExt for specta_typescript::Typescript {
 
     fn export(self, cfg: &BuilderConfiguration, path: &Path) -> Result<(), Self::Error> {
         let cfg = cfg.clone();
-        let types = hide_unused_std_result_type(&cfg, cfg.types.clone());
+        let types = hide_framework_types(&cfg, cfg.types.clone());
         let format = SpectaFormat::new(&cfg);
 
         Exporter::from(self)
@@ -48,7 +48,7 @@ impl LanguageExt for specta_typescript::JSDoc {
 
     fn export(self, cfg: &BuilderConfiguration, path: &Path) -> Result<(), Self::Error> {
         let cfg = cfg.clone();
-        let types = hide_unused_std_result_type(&cfg, cfg.types.clone());
+        let types = hide_framework_types(&cfg, cfg.types.clone());
         let format = SpectaFormat::new(&cfg);
 
         Exporter::from(self)
@@ -104,15 +104,22 @@ fn runtime(
         ));
     }
 
-    let is_channel_used = cfg.commands.iter().any(|command| {
-        // Check if any argument is a Channel
+    let is_reply_used = cfg.commands.iter().any(|command| {
         command
             .args()
             .iter()
-            .any(|(_, dt)| is_channel_type(dt, exporter.types))
-            // Check if result contains a Channel
-            || command.result().is_some_and(|dt| is_channel_type(dt, exporter.types))
+            .any(|(_, dt)| reply_generic_type(dt, exporter.types).is_some())
     });
+    let is_channel_used = is_reply_used
+        || cfg.commands.iter().any(|command| {
+            // Check if any argument is a Channel
+            command
+                .args()
+                .iter()
+                .any(|(_, dt)| is_channel_type(dt, exporter.types))
+                // Check if result contains a Channel
+                || command.result().is_some_and(|dt| is_channel_type(dt, exporter.types))
+        });
     let is_channel_transform_used = cfg.commands.iter().any(|command| {
         command.args().iter().any(|(_, dt)| {
             channel_generic_type(dt, exporter.types).is_some_and(|dt| {
@@ -168,8 +175,26 @@ fn runtime(
                 serde_json::to_string(&resolve_tauri_command_name(cfg.plugin_name, command.name()))
                     .expect("failed to serialize string");
 
-            let arguments = command
+            let reply = command
                 .args()
+                .iter()
+                .find_map(|(name, dt)| reply_generic_type(dt, exporter.types).map(|ok| (name, ok)));
+            if reply.is_some() && (jsdoc || cfg.error_handling == ErrorHandlingMode::Result) {
+                return Err(Error::framework(
+                    "",
+                    format!(
+                        "command '{}' takes a Reply, which only TypeScript bindings in throw mode support",
+                        command.name()
+                    ),
+                ));
+            }
+            let params = command
+                .args()
+                .iter()
+                .filter(|(_, dt)| reply_generic_type(dt, exporter.types).is_none())
+                .collect::<Vec<_>>();
+
+            let arguments = params
                 .iter()
                 .map(|(name, dt)| {
                     Ok((
@@ -199,13 +224,12 @@ fn runtime(
                 .collect::<Vec<_>>()
                 .join(", ");
 
-            let arguments_invoke_obj = if command.args().is_empty() {
+            let arguments_invoke_obj = if params.is_empty() {
                 Default::default()
             } else {
                 format!(
                     ", {{ {} }}",
-                    command
-                        .args()
+                    params
                         .iter()
                         .map(|(name, dt)| {
                             let name = name.to_lower_camel_case();
@@ -241,7 +265,13 @@ fn runtime(
                 )
             };
 
-            let invoke_args = format!("({command_name_escaped}{arguments_invoke_obj})",);
+            let invoke_args = match reply {
+                Some((name, _)) => format!(
+                    "({command_name_escaped}, \"{}\"{arguments_invoke_obj})",
+                    name.to_lower_camel_case()
+                ),
+                None => format!("({command_name_escaped}{arguments_invoke_obj})"),
+            };
 
             let body = if cfg.error_handling == ErrorHandlingMode::Result
                 && let Some(result) = command.result()
@@ -339,11 +369,16 @@ fn runtime(
                     }
                 }
             } else {
-                let mut invoke_ts = "__TAURI_INVOKE".to_string();
-                let output_dt = command
-                    .result()
-                    .and_then(|dt| extract_std_result(dt, exporter.types).map(|(ok, _)| ok))
-                    .or(command.result());
+                let (mut invoke_ts, output_dt) = match reply {
+                    Some((_, ok)) => ("__TAURI_REPLY".to_string(), Some(ok)),
+                    None => (
+                        "__TAURI_INVOKE".to_string(),
+                        command
+                            .result()
+                            .and_then(|dt| extract_std_result(dt, exporter.types).map(|(ok, _)| ok))
+                            .or(command.result()),
+                    ),
+                };
 
                 if !jsdoc {
                     let output_semantic_type = output_dt.is_some_and(|dt| {
@@ -357,11 +392,9 @@ fn runtime(
                         )
                     });
                     invoke_ts.push('<');
-                    invoke_ts.push_str(&match command.result() {
+                    invoke_ts.push_str(&match output_dt {
                         Some(dt) => Cow::Owned(render_reference_dt_for_phase(
-                            extract_std_result(dt, exporter.types)
-                                .map(|(ok, _)| ok)
-                                .unwrap_or(dt),
+                            dt,
                             if output_semantic_type {
                                 Phase::Deserialize
                             } else {
@@ -645,8 +678,16 @@ fn runtime(
     }
 
     // Runtime
-    if has_typed_error || enabled_events || is_channel_transform_used {
+    if has_typed_error || enabled_events || is_channel_transform_used || is_reply_used {
         out.push_str("\n/* Tauri Specta runtime */\n");
+
+        if is_reply_used {
+            out.push_str(REPLY_IMPL_TS);
+            out.push('\n');
+            if is_channel_transform_used || has_typed_error || enabled_events {
+                out.push('\n');
+            }
+        }
 
         if is_channel_transform_used {
             out.push_str(map_channel_impl);
@@ -762,7 +803,7 @@ fn extract_std_result<'a>(
     None
 }
 
-fn hide_unused_std_result_type(cfg: &BuilderConfiguration, mut types: Types) -> Types {
+fn hide_framework_types(cfg: &BuilderConfiguration, mut types: Types) -> Types {
     let is_std_result_used_after_command_result_flattening = cfg.commands.iter().any(|command| {
         command
             .args()
@@ -790,12 +831,10 @@ fn hide_unused_std_result_type(cfg: &BuilderConfiguration, mut types: Types) -> 
             }
         });
 
-    if is_std_result_used_after_command_result_flattening {
-        return types;
-    }
-
     types.iter_mut(|ndt| {
-        if is_result_ndt(ndt) {
+        if (is_result_ndt(ndt) && !is_std_result_used_after_command_result_flattening)
+            || (ndt.name == "TAURI_SPECTA_REPLY" && ndt.module_path.starts_with("tauri_specta::"))
+        {
             ndt.ty = None;
         }
     });
@@ -862,11 +901,24 @@ fn is_channel_type(dt: &DataType, types: &Types) -> bool {
 }
 
 fn channel_generic_type<'a>(dt: &'a DataType, types: &Types) -> Option<&'a DataType> {
+    wrapper_generic_type(dt, types, "TAURI_CHANNEL", "tauri::")
+}
+
+fn reply_generic_type<'a>(dt: &'a DataType, types: &Types) -> Option<&'a DataType> {
+    wrapper_generic_type(dt, types, "TAURI_SPECTA_REPLY", "tauri_specta::")
+}
+
+fn wrapper_generic_type<'a>(
+    dt: &'a DataType,
+    types: &Types,
+    name: &str,
+    module: &str,
+) -> Option<&'a DataType> {
     let DataType::Reference(Reference::Named(r)) = dt else {
         return None;
     };
     let ndt = types.get(r)?;
-    if ndt.name != "TAURI_CHANNEL" || !ndt.module_path.starts_with("tauri::") {
+    if ndt.name != name || !ndt.module_path.starts_with(module) {
         return None;
     }
     match &r.inner {
@@ -957,7 +1009,7 @@ fn semantic_types_runtime_types(cfg: &BuilderConfiguration) -> Result<Option<Typ
         return Ok(None);
     }
 
-    let types = hide_unused_std_result_type(cfg, cfg.types.clone());
+    let types = hide_framework_types(cfg, cfg.types.clone());
     let types = if cfg.disable_serde_phases {
         specta_serde::Format.map_types(&types)
     } else {
@@ -1001,6 +1053,7 @@ fn render_reference_dt(dt: &DataType, exporter: &FrameworkExporter) -> Result<St
 
 const RESERVED_NDT_NAMES: &[&str] = &[
     "Channel",
+    "__TAURI_REPLY",
     "__TAURI_EVENT",
     "__TAURI_INVOKE",
     "typedError",
@@ -1018,6 +1071,13 @@ const TYPED_ERROR_IMPL_TS: &str = r#"async function typedError<T, E>(result: Pro
         if (e instanceof Error) throw e;
         return { status: "error", error: e as any };
     }
+}"#;
+
+const REPLY_IMPL_TS: &str = r#"function __TAURI_REPLY<T>(command: string, reply: string, args: Record<string, unknown> = {}): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const channel = new Channel<{ ok: T } | { err: unknown }>((a) => ("ok" in a ? resolve(a.ok) : reject(a.err)));
+        __TAURI_INVOKE(command, { ...args, [reply]: channel }).catch(reject);
+    });
 }"#;
 
 const MAP_CHANNEL_IMPL_TS: &str = r#"function mapChannel<T>(channel: Channel<T>, deserialize: (payload: any) => T): Channel<T> {
