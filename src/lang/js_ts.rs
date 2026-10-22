@@ -1114,6 +1114,7 @@ const RESERVED_NDT_NAMES: &[&str] = &[
     "Channel",
     "__TAURI_MATCH",
     "__TAURI_REPLY",
+    "ReplyTo",
     "__TAURI_VARIANT",
     "__TAURI_EVENT",
     "__TAURI_INVOKE",
@@ -1136,7 +1137,10 @@ const TYPED_ERROR_IMPL_TS: &str = r#"async function typedError<T, E>(result: Pro
 
 const MATCH_IMPL_TS: &str = r#"type __TAURI_VARIANT<V> = { [K in keyof V]-?: [V[K]] extends [undefined] ? never : K }[keyof V];
 
-function __TAURI_MATCH<V extends object, R>(request: V, reply: Promise<R>): Promise<Extract<R, Record<__TAURI_VARIANT<V>, unknown>>[__TAURI_VARIANT<V> & keyof Extract<R, Record<__TAURI_VARIANT<V>, unknown>>]> {
+/** The member of `R` answering the variant `V` was sent as. */
+export type ReplyTo<R, V> = Extract<R, Record<__TAURI_VARIANT<V>, unknown>>[__TAURI_VARIANT<V> & keyof Extract<R, Record<__TAURI_VARIANT<V>, unknown>>];
+
+function __TAURI_MATCH<V extends object, R>(request: V, reply: Promise<R>): Promise<ReplyTo<R, V>> {
     return reply.then((r) => (r as Record<string, any>)[Object.keys(request)[0]]);
 }"#;
 
