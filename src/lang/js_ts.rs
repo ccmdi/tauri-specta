@@ -167,6 +167,8 @@ fn runtime(
         out.push_str("import * as __TAURI_EVENT from \"@tauri-apps/api/event\";\n");
     }
 
+    let mut is_match_used = false;
+
     // Commands
     if enabled_commands {
         let mut s = Struct::named();
@@ -210,6 +212,23 @@ fn runtime(
                     ))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
+
+            let output = reply.map(|(_, ok)| ok).or_else(|| {
+                command.result().map(|dt| {
+                    extract_std_result(dt, exporter.types)
+                        .map(|(ok, _)| ok)
+                        .unwrap_or(dt)
+                })
+            });
+            let matched = match (params.as_slice(), output) {
+                ([(_, request)], Some(output))
+                    if !jsdoc && answers_by_variant(request, output, exporter.types) =>
+                {
+                    arguments.first().cloned()
+                }
+                _ => None,
+            };
+            is_match_used |= matched.is_some();
 
             let fn_arguments = arguments
                 .iter()
@@ -432,7 +451,13 @@ fn runtime(
                 }
             };
 
-            let mut field = Field::new(define(format!("({fn_arguments}) => {body}")).into());
+            let signature = match &matched {
+                Some((name, ty)) => {
+                    format!("<V extends {ty}>({name}: V) => __TAURI_MATCH({name}, {body})")
+                }
+                None => format!("({fn_arguments}) => {body}"),
+            };
+            let mut field = Field::new(define(signature).into());
             field.deprecated = command.deprecated.clone();
             field.docs = {
                 let mut docs = command.docs.to_string();
@@ -678,8 +703,21 @@ fn runtime(
     }
 
     // Runtime
-    if has_typed_error || enabled_events || is_channel_transform_used || is_reply_used {
+    if has_typed_error
+        || enabled_events
+        || is_channel_transform_used
+        || is_reply_used
+        || is_match_used
+    {
         out.push_str("\n/* Tauri Specta runtime */\n");
+
+        if is_match_used {
+            out.push_str(MATCH_IMPL_TS);
+            out.push('\n');
+            if is_reply_used || is_channel_transform_used || has_typed_error || enabled_events {
+                out.push('\n');
+            }
+        }
 
         if is_reply_used {
             out.push_str(REPLY_IMPL_TS);
@@ -904,6 +942,27 @@ fn channel_generic_type<'a>(dt: &'a DataType, types: &Types) -> Option<&'a DataT
     wrapper_generic_type(dt, types, "TAURI_CHANNEL", "tauri::")
 }
 
+/// Whether `output` answers `request` variant for variant: both are enums with the same
+/// variants, so a request's variant picks its answer's.
+fn answers_by_variant(request: &DataType, output: &DataType, types: &Types) -> bool {
+    let variants = |dt: &DataType| {
+        let DataType::Reference(Reference::Named(r)) = dt else {
+            return None;
+        };
+        let Some(DataType::Enum(e)) = &types.get(r)?.ty else {
+            return None;
+        };
+        Some(
+            e.variants
+                .iter()
+                .filter(|(_, variant)| !variant.skip)
+                .map(|(name, _)| name.to_string())
+                .collect::<Vec<_>>(),
+        )
+    };
+    matches!((variants(request), variants(output)), (Some(a), Some(b)) if a == b)
+}
+
 fn reply_generic_type<'a>(dt: &'a DataType, types: &Types) -> Option<&'a DataType> {
     wrapper_generic_type(dt, types, "TAURI_SPECTA_REPLY", "tauri_specta::")
 }
@@ -1053,7 +1112,9 @@ fn render_reference_dt(dt: &DataType, exporter: &FrameworkExporter) -> Result<St
 
 const RESERVED_NDT_NAMES: &[&str] = &[
     "Channel",
+    "__TAURI_MATCH",
     "__TAURI_REPLY",
+    "__TAURI_VARIANT",
     "__TAURI_EVENT",
     "__TAURI_INVOKE",
     "typedError",
@@ -1071,6 +1132,12 @@ const TYPED_ERROR_IMPL_TS: &str = r#"async function typedError<T, E>(result: Pro
         if (e instanceof Error) throw e;
         return { status: "error", error: e as any };
     }
+}"#;
+
+const MATCH_IMPL_TS: &str = r#"type __TAURI_VARIANT<V> = { [K in keyof V]-?: [V[K]] extends [undefined] ? never : K }[keyof V];
+
+function __TAURI_MATCH<V extends object, R>(request: V, reply: Promise<R>): Promise<Extract<R, Record<__TAURI_VARIANT<V>, unknown>>[__TAURI_VARIANT<V> & keyof Extract<R, Record<__TAURI_VARIANT<V>, unknown>>]> {
+    return reply.then((r) => (r as Record<string, any>)[Object.keys(request)[0]]);
 }"#;
 
 const REPLY_IMPL_TS: &str = r#"function __TAURI_REPLY<T>(command: string, reply: string, args: Record<string, unknown> = {}): Promise<T> {
